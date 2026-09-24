@@ -30,6 +30,8 @@ pub enum KycError {
     MigrationVersionNotSequential = 10,
     /// Batch subjects list exceeds the maximum of 20 entries.
     BatchTooLarge = 11,
+    /// The address is already in the admin list.
+    AdminAlreadyExists = 12,
 }
 
 /// Composite key for per-subject lifecycle history entries.
@@ -236,10 +238,11 @@ impl KycRegistry {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         let mut list = Self::admin_list(&env);
-        if !list.contains(&new_admin) {
-            list.push_back(new_admin.clone());
-            env.storage().instance().set(&DataKey::AdminList, &list);
+        if list.contains(&new_admin) {
+            panic_with_error!(env, KycError::AdminAlreadyExists);
         }
+        list.push_back(new_admin.clone());
+        env.storage().instance().set(&DataKey::AdminList, &list);
         env.events()
             .publish((symbol_short!("admin_add"),), new_admin);
     }
@@ -249,7 +252,12 @@ impl KycRegistry {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         let list = Self::admin_list(&env);
-        if list.len() <= 1 {
+        // Fail fast: an empty or missing admin list is an invalid state.
+        if list.is_empty() {
+            panic_with_error!(env, KycError::EmptyAdminList);
+        }
+        // Guard: removing the last admin would leave the registry permanently locked.
+        if list.len() == 1 {
             panic_with_error!(env, KycError::EmptyAdminList);
         }
         let mut new_list: Vec<Address> = Vec::new(&env);
@@ -1088,6 +1096,12 @@ impl KycRegistry {
     fn validate_jurisdiction(env: &Env, jurisdiction: &String) {
         // Invalid jurisdiction attempts are not emitted as events to avoid
         // event-stream spam from malicious callers.
+        //
+        // Explicit empty-string guard: an empty jurisdiction is meaningless and
+        // must be rejected before any further processing.
+        if jurisdiction.is_empty() {
+            panic_with_error!(env, KycError::InvalidJurisdiction);
+        }
         if jurisdiction.len() != 2 {
             panic_with_error!(env, KycError::InvalidJurisdiction);
         }

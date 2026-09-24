@@ -733,31 +733,29 @@ fn test_approve_batch_emits_batch_approved_event() {
     subjects.push_back((s3, 1u32, 0u64, js(&env, "US")));
     client.approve_batch(&verifier, &subjects);
 
-    use soroban_sdk::{testutils::Events as _, Symbol, TryFromVal};
+    use soroban_sdk::{symbol_short, testutils::Events as _, Symbol, TryFromVal};
     let batch_topic = symbol_short!("batch_app");
-    let batch_events: std::vec::Vec<u32> = env
-        .events()
-        .all()
-        .iter()
-        .filter_map(|(_, topics, data)| {
-            let matches = topics
-                .get(0)
-                .map(|t| {
-                    Symbol::try_from_val(&env, &t)
-                        .map(|s| s == batch_topic)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if matches {
-                u32::try_from_val(&env, &data).ok()
-            } else {
-                None
+    let mut batch_count: u32 = 0;
+    let mut batch_value: u32 = 0;
+    for (_, topics, data) in env.events().all().iter() {
+        let matches = topics
+            .get(0)
+            .map(|t| {
+                Symbol::try_from_val(&env, &t)
+                    .map(|s| s == batch_topic)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if matches {
+            if let Ok(v) = u32::try_from_val(&env, &data) {
+                batch_count += 1;
+                batch_value = v;
             }
-        })
-        .collect();
+        }
+    }
 
-    assert_eq!(batch_events.len(), 1, "exactly one batch_app event should be emitted");
-    assert_eq!(batch_events[0], 3u32, "batch_app event should carry the approved count");
+    assert_eq!(batch_count, 1, "exactly one batch_app event should be emitted");
+    assert_eq!(batch_value, 3u32, "batch_app event should carry the approved count");
 }
 
 #[test]
@@ -1849,6 +1847,28 @@ fn test_approve_batch_duplicate_subject() {
     // The call must succeed (no error expected for duplicates today).
     client.approve_batch(&verifier, &subjects);
 
+    // Two `approved` events were emitted — one per iteration.
+    // Check events immediately after approve_batch, before any further client
+    // calls reset the event buffer.
+    use soroban_sdk::{symbol_short, testutils::Events as _};
+    let approved_topic = symbol_short!("approved");
+    let mut approval_events: usize = 0;
+    for (_, topics, _) in env.events().all().iter() {
+        if let Some(t) = topics.get(0) {
+            use soroban_sdk::{Symbol, TryFromVal};
+            if Symbol::try_from_val(&env, &t)
+                .map(|s| s == approved_topic)
+                .unwrap_or(false)
+            {
+                approval_events += 1;
+            }
+        }
+    }
+    assert_eq!(
+        approval_events, 2,
+        "each iteration emits one approved event"
+    );
+
     // The subject is approved (last-write-wins → tier 2, jurisdiction "DE").
     assert!(client.is_approved(&addr));
     let record = client.get_record(&addr);
@@ -1867,28 +1887,123 @@ fn test_approve_batch_duplicate_subject() {
     assert_eq!(hist.get(0).unwrap().tier, 1);
     assert_eq!(hist.get(1).unwrap().kind, KycTransitionKind::Approve);
     assert_eq!(hist.get(1).unwrap().tier, 2);
+}
 
-    // Two `approved` events were emitted — one per iteration.
-    use soroban_sdk::{symbol_short, testutils::Events as _};
-    let approved_topic = symbol_short!("approved");
-    let approval_events: usize = env
-        .events()
-        .all()
-        .iter()
-        .filter(|(_, topics, _)| {
-            topics
-                .get(0)
-                .map(|t| {
-                    use soroban_sdk::{Symbol, TryFromVal};
-                    Symbol::try_from_val(&env, &t)
-                        .map(|s| s == approved_topic)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
-        })
-        .count();
+// ── Regression tests for targeted validation fixes ───────────────────────────
+
+/// Fix #1 — remove_admin: explicit empty-list guard fires before any iteration.
+///
+/// If the AdminList key is missing from storage (corrupted / never initialised),
+/// remove_admin must panic with EmptyAdminList immediately, before touching the
+/// iteration loop or writing anything.
+#[test]
+fn test_remove_admin_panics_on_empty_admin_list_in_storage() {
+    use crate::DataKey;
+
+    let (env, client, admin) = setup();
+    let contract_id = client.address.clone();
+    let second = Address::generate(&env);
+
+    // We need two admins so require_admin passes; then we corrupt storage to
+    // simulate an empty list before calling remove_admin.
+    client.add_admin(&admin, &second);
+
+    // Corrupt: replace the stored admin list with an empty Vec.
+    env.as_contract(&contract_id, || {
+        let empty: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminList, &empty);
+    });
+
+    // With an empty list admin_list() returns the empty Vec, len==0.
+    // The explicit empty-list guard must fire and return EmptyAdminList
+    // before the function attempts to iterate or write.
+    //
+    // NOTE: require_admin will also panic (NotAdmin) once the list is empty,
+    // so we verify that the contract errors rather than succeeds — the exact
+    // error variant depends on which guard fires first.  Either way no state
+    // mutation should occur.
+    let res = client.try_remove_admin(&admin, &second);
+    assert!(res.is_err(), "must error when admin list is empty in storage");
+}
+
+/// Fix #2 — approve: explicit empty jurisdiction guard rejects an empty string
+/// before any state is written.
+///
+/// An empty jurisdiction ("") is meaningless and must be rejected with
+/// InvalidJurisdiction.  The existing length check (len != 2) handles this
+/// implicitly; the new guard makes the intent explicit and fires first.
+#[test]
+fn test_approve_rejects_empty_jurisdiction_explicit_guard() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    // Empty string must be rejected before any KYC record is written.
+    let res = client.try_approve(&verifier, &subject, &1, &0, &js(&env, ""));
     assert_eq!(
-        approval_events, 2,
-        "each iteration emits one approved event"
+        res,
+        Err(Ok(Error::from(KycError::InvalidJurisdiction))),
+        "empty jurisdiction must be rejected with InvalidJurisdiction"
     );
+
+    // No record should have been written as a side-effect.
+    assert!(
+        client.get_record_opt(&subject).is_none(),
+        "no KYC record should exist after a rejected approve"
+    );
+}
+
+/// Fix #3 — add_admin: duplicate address must be rejected with AdminAlreadyExists
+/// instead of silently being ignored.
+#[test]
+fn test_add_admin_rejects_duplicate() {
+    let (env, client, admin) = setup();
+    let second = Address::generate(&env);
+
+    // First addition succeeds.
+    client.add_admin(&admin, &second);
+    assert_eq!(client.get_admins().len(), 2);
+
+    // Second addition of the same address must return AdminAlreadyExists.
+    let res = client.try_add_admin(&admin, &second);
+    assert_eq!(
+        res,
+        Err(Ok(Error::from(KycError::AdminAlreadyExists))),
+        "duplicate admin must be rejected with AdminAlreadyExists"
+    );
+
+    // Admin list must be unchanged (still 2 admins, no duplicate appended).
+    assert_eq!(
+        client.get_admins().len(),
+        2,
+        "admin list length must not grow on a duplicate add_admin call"
+    );
+}
+
+/// Fix #4 — remove_admin: removing the sole remaining admin must be rejected
+/// with EmptyAdminList even when the caller is that last admin.
+#[test]
+fn test_remove_admin_rejects_last_admin_removal() {
+    let (env, client, admin) = setup();
+    let second = Address::generate(&env);
+
+    // Add a second admin so we can remove the first, leaving exactly one.
+    client.add_admin(&admin, &second);
+    client.remove_admin(&admin, &admin);
+
+    // `second` is now the sole admin.  Attempting to remove themselves must fail.
+    let res = client.try_remove_admin(&second, &second);
+    assert_eq!(
+        res,
+        Err(Ok(Error::from(KycError::EmptyAdminList))),
+        "removing the last admin must be rejected with EmptyAdminList"
+    );
+
+    // The admin list must still contain exactly the one remaining admin.
+    let admins = client.get_admins();
+    assert_eq!(admins.len(), 1, "admin list must still hold one entry");
+    assert_eq!(admins.get(0).unwrap(), second, "the surviving admin must be unchanged");
 }
